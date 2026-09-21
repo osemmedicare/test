@@ -673,7 +673,13 @@ function buildMedicationSheetRecord_(headers, values) {
     duration_type: cleanMedicationString_(row["Duration Type"]),
     start_date: normalizeMedicationDate_(row["Start Date"]),
     end_date: normalizeMedicationDate_(row["End Date"]),
-    noted_by: cleanMedicationString_(row["Noted By"]),
+    // "Noted By" is always the human-readable name (internal staff or an
+    // external doctor typed via "Others"). "Noted By StaffID" is populated
+    // only when an internal tbl_staff member was picked — it is what
+    // actually satisfies the noted_by FK. Kept as two separate sheet columns
+    // so the sheet stays human-readable regardless of which case applies.
+    noted_by_text: cleanMedicationString_(row["Noted By"]),
+    noted_by_staff_id: cleanMedicationString_(row["Noted By StaffID"]),
     ordered_by: cleanMedicationString_(row["Ordered By"]),
     supplied_by: cleanMedicationString_(row["Supplied By"]),
     status: cleanMedicationString_(row["Status"]),
@@ -710,7 +716,13 @@ function resolveMedicationForeignKeys_(raw, options) {
     duration_type: raw.duration_type,
     start_date: raw.start_date,
     end_date: raw.end_date,
-    noted_by: raw.noted_by,
+    // noted_by is a FK to tbl_staff.StaffID — only set it when the sheet
+    // actually supplied a StaffID (an internal staff member was picked).
+    // Otherwise the noting person is not staff (e.g. a visiting doctor
+    // entered via "Others"), so their name goes into the free-text
+    // noted_by_external_name column instead and noted_by stays null.
+    noted_by: raw.noted_by_staff_id || null,
+    noted_by_external_name: raw.noted_by_staff_id ? null : raw.noted_by_text,
     ordered_by: raw.ordered_by,
     supplied_by: raw.supplied_by,
     status: raw.status,

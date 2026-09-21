@@ -2,27 +2,31 @@
 // Deployed under osemmedicare@gmail.com as a Google Apps Script Web App.
 //
 // SETUP:
-// 1. This file lives in the same Apps Script project as medicationsync.gs.
-// 2. Replace SHARED_SECRET below with a strong random string, then add the
-//    same value as MEDICATION_ORDER_SCRIPT_SECRET in Vercel env vars.
-// 3. Deploy → New deployment → Web app.
+// 1. This file lives in the same Apps Script project as Config.gs, Utils.gs,
+//    MedicationSync.gs and MedicationSummary.gs, and reuses their shared
+//    CONFIG object and functions instead of duplicating them.
+// 2. Deploy → New deployment → Web app.
 //      Execute as: Me (osemmedicare@gmail.com)
 //      Who has access: Anyone
 //    ("Anyone" is required since Next.js calls this over plain HTTPS with no
 //    Google login — the SHARED_SECRET check is the actual access control.)
-// 4. Copy the /exec URL into MEDICATION_ORDER_SCRIPT_URL in Vercel env vars.
-// 5. Whenever this code changes: Deploy → Manage deployments → edit existing
+// 3. Copy the /exec URL into MEDICATION_ORDER_SCRIPT_URL in Vercel env vars,
+//    and make sure SHARED_SECRET below matches MEDICATION_ORDER_SCRIPT_SECRET.
+// 4. Whenever this code changes: Deploy → Manage deployments → edit existing
 //    deployment → New version. A plain Ctrl+S does NOT update the /exec URL.
 //
-// WHY THE ASYNC TRIGGER APPROACH:
-// Apps Script onEdit triggers do NOT fire for programmatic writes made by
-// this script. To sync to Supabase, we schedule a one-shot time-based
-// trigger to call syncAllMedicationOrdersToSupabase() ~30 seconds after
-// the sheet write. This keeps the web app response fast while ensuring the
-// sync runs promptly using the same proven function the 24h cron uses.
+// WHY A DIRECT, SYNCHRONOUS CALL (no async trigger):
+// Apps Script onEdit/onChange triggers do NOT fire for programmatic writes
+// made by this script. MedicationSummary.gs already ships the exact entry
+// point bots/APIs are meant to use for that: syncMedicationOrderAndSummaryNow().
+// It (1) syncs just this one row to Supabase tbl_medication_orders and
+// (2) rebuilds tbl_residents.current_medication_list for the resident(s)
+// affected — a handful of HTTP calls, well inside Vercel's function timeout.
+// A prior version of this file scheduled a 30s-delayed trigger that called
+// the full syncAllMedicationOrdersToSupabase() reconciliation instead; that
+// never rebuilt current_medication_list and was slower for no benefit, so it
+// was removed in favor of calling the targeted function directly.
 
-const SPREADSHEET_ID = "1HXT8HFjjjBakaZiLeU9FggM8cKLZJDBrUjnNqRK3goA";
-const SHEET_NAME = "tbl_medicationorder";
 const SHARED_SECRET = "k-google-mirror-osem2020";
 
 // Column names exactly as defined in the sheet — do not reorder.
@@ -45,6 +49,7 @@ const COLUMNS = [
   "Start Date",
   "End Date",
   "Noted By",
+  "Noted By StaffID",
   "Ordered By",
   "Supplied By",
   "Status",
@@ -83,8 +88,11 @@ function jsonResponse(data) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+// Reuses the shared CONFIG (Config.gs) and getMedicationSheet() (Utils.gs) so
+// this file can never point at a different spreadsheet/tab name than
+// MedicationSync.gs / MedicationSummary.gs do.
 function getSheet() {
-  return SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+  return getMedicationSheet(CONFIG.SHEETS.MEDICATION_ORDER);
 }
 
 // Maps each header cell to its 0-based column index so writes use the live
@@ -99,11 +107,12 @@ function buildColumnMap(headerRow) {
 
 // Appends a new row. All COLUMNS fields are placed in the correct column
 // based on the live header; unmapped payload keys are silently ignored.
-// Schedules an async Supabase sync after the sheet write.
+// Syncs to Supabase and rebuilds the resident's medication summary before
+// returning (see syncOrderAndSummary_ below).
 function createOrder(order) {
   const sheet = getSheet();
   if (!sheet) {
-    return { success: false, error: "Sheet '" + SHEET_NAME + "' not found in spreadsheet" };
+    return { success: false, error: "Sheet '" + CONFIG.SHEETS.MEDICATION_ORDER + "' not found in spreadsheet" };
   }
 
   const lastCol = sheet.getLastColumn();
@@ -123,22 +132,20 @@ function createOrder(order) {
 
   sheet.appendRow(row);
 
-  // Schedule a one-shot sync ~30 s from now.
-  // onEdit does not fire for script writes, so we trigger the same
-  // syncAllMedicationOrdersToSupabase function the 24h cron uses.
-  scheduleMedSync_();
-
-  return { success: true };
+  return Object.assign(
+    { success: true },
+    syncOrderAndSummary_(order["RxOrderID"], order["ResidentID"])
+  );
 }
 
 // Finds the row whose RxOrderID matches, then updates every field in the
 // payload except RxOrderID (immutable) and any key not present in the payload
-// (left unchanged).
-// Schedules an async Supabase sync after the sheet write.
+// (left unchanged). Syncs to Supabase and rebuilds the affected resident's
+// medication summary before returning (see syncOrderAndSummary_ below).
 function updateOrder(rxOrderId, order) {
   const sheet = getSheet();
   if (!sheet) {
-    return { success: false, error: "Sheet '" + SHEET_NAME + "' not found in spreadsheet" };
+    return { success: false, error: "Sheet '" + CONFIG.SHEETS.MEDICATION_ORDER + "' not found in spreadsheet" };
   }
 
   const lastRow = sheet.getLastRow();
@@ -176,9 +183,6 @@ function updateOrder(rxOrderId, order) {
 
       sheet.getRange(rowNum, 1, 1, newRow.length).setValues([newRow]);
       found = true;
-
-      // Schedule a one-shot sync ~30 s from now.
-      scheduleMedSync_();
       break;
     }
   }
@@ -187,24 +191,71 @@ function updateOrder(rxOrderId, order) {
     return { success: false, error: "Order not found: " + rxOrderId };
   }
 
-  return { success: true };
+  return Object.assign(
+    { success: true },
+    syncOrderAndSummary_(rxOrderId, order["ResidentID"])
+  );
 }
 
-// ─── Async sync scheduling ────────────────────────────────────────────────────
+// ─── Supabase sync + resident summary rebuild ─────────────────────────────────
 //
-// Creates a one-shot time-based trigger that fires syncAllMedicationOrdersToSupabase
-// ~30 seconds from now. Because that function acquires a script lock, multiple
-// back-to-back triggers serialize safely without duplicating work.
+// syncMedicationOrderAndSummaryNow (MedicationSummary.gs, same project) is the
+// documented immediate entry point for bots/APIs: it syncs this one row to
+// Supabase tbl_medication_orders, then rebuilds tbl_residents.current_medication_list
+// (and its Google tbl_ResidentList mirror) for whichever resident(s) it
+// affects — the current resident, and the previous one too if ResidentID
+// changed on an update.
+//
+// A failure here does NOT undo the sheet write above — the Google Sheet
+// remains the source of truth. Retries a couple of times inline first (most
+// failures at this point are transient Supabase/network blips), then leaves
+// the row for the two automatic safety nets to pick up:
+//   - MedicationSummary.gs's 1-minute heartbeat (medicationSummaryHeartbeat)
+//   - MedicationSync.gs's 24-hour reconciliation (syncAllMedicationOrdersToSupabase)
+// Both re-run the same underlying sync, so a row that fails here is retried
+// automatically without any human action — PROVIDED those triggers are
+// actually installed. If they are not, run setupMedicationSummaryTrigger()
+// and setupMedicationReconciliationTrigger() once each (Apps Script editor,
+// or the Triggers/clock-icon page to confirm they exist) — those two
+// triggers are what actually makes "sync must not fail" true; this function
+// is only the fast path.
+function syncOrderAndSummary_(rxOrderId, residentId) {
+  const MAX_ATTEMPTS = 2;
+  let lastError;
 
-function scheduleMedSync_() {
-  try {
-    ScriptApp.newTrigger("syncAllMedicationOrdersToSupabase")
-      .timeBased()
-      .after(30 * 1000)
-      .create();
-  } catch (err) {
-    // Log but never fail the sheet write — the 24h reconciliation cron
-    // remains the authoritative safety net.
-    console.error("scheduleMedSync_: could not create trigger:", err);
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const result = syncMedicationOrderAndSummaryNow(rxOrderId, residentId);
+      return { supabaseSync: result };
+    } catch (err) {
+      lastError = err;
+      const message = err && err.message ? err.message : String(err);
+      console.error(
+        "syncOrderAndSummary_ attempt " + attempt + "/" + MAX_ATTEMPTS +
+        " failed for RxOrderID " + rxOrderId + ": " + message
+      );
+      if (attempt < MAX_ATTEMPTS) {
+        Utilities.sleep(800);
+      }
+    }
   }
+
+  const message = lastError && lastError.message ? lastError.message : String(lastError);
+
+  // Write the failure into the visible tbl_MedicationSyncLog sheet (function
+  // shared from MedicationSync.gs), not just the execution transcript — so a
+  // human can see it without opening Apps Script logs.
+  try {
+    logMedicationSyncError_(findMedicationRowByRxOrderID_(rxOrderId), lastError);
+  } catch (logErr) {
+    console.error("Could not write to tbl_MedicationSyncLog: " + logErr);
+  }
+
+  return {
+    supabaseSync: {
+      success: false,
+      error: message,
+      willRetryAutomatically: true
+    }
+  };
 }
